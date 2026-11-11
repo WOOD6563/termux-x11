@@ -117,6 +117,17 @@ STATIC_INLINE void LorieBuffer_release(LorieBuffer* _Nullable buffer) {
 const LorieBuffer_Desc* _Nonnull LorieBuffer_description(LorieBuffer* _Nullable buffer);
 
 /**
+ * Duplicate the backing fd of an FD buffer for DRI3 export.
+ *
+ * @param buffer buffer to export
+ * @param offset receives the byte offset in the exported fd
+ * @return a close-on-exec fd, or -1 when the buffer is not FD-backed
+ */
+int LorieBuffer_exportFileDescriptor(LorieBuffer* _Nullable buffer,
+                                     uint32_t* _Nonnull offset,
+                                     uint32_t* _Nonnull size);
+
+/**
  * Lock the AHardwareBuffer for direct CPU access.
  * See AHardwareBuffer_lock() description for details
  *

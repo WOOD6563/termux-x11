@@ -24,6 +24,7 @@
 #include <sys/mman.h>
 #include <dri3.h>
 #include <sys/stat.h>
+#include <fcntl.h>
 #include <dlfcn.h>
 #include "fb.h"
 #include "inputstr.h"
@@ -130,8 +131,16 @@ static LorieBuffer *lorieEnsureGpuSampleable(PixmapPtr pixmap, int8_t type) {
         LorieBuffer_convert(priv->buffer, type, AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM);
         if (desc->type != LORIEBUFFER_REGULAR) {
             // LorieBuffer_convert does not report status but it does not let the type change in the case of error.
+            // Conversion frees the regular buffer that priv->locked used to
+            // reference.  Do not leave EXA with that dangling CPU pointer:
+            // the next PrepareAccess must lock the new backing allocation so
+            // DMA-BUF CPU cache synchronization brackets every X write.
+            priv->locked = NULL;
+            priv->wasLocked = false;
+            pixmap->devPrivate.ptr = NULL;
             pScreenPtr->ModifyPixmapHeader(pixmap, 0, 0, 0, 0, desc->stride * 4, NULL);
-            LorieBuffer_lock(priv->buffer, &priv->locked);
+            if (type == LORIEBUFFER_AHARDWAREBUFFER)
+                LorieBuffer_lock(priv->buffer, &priv->locked);
         }
     }
 
@@ -1117,6 +1126,11 @@ static PixmapPtr loriePixmapFromFds(ScreenPtr screen, CARD8 num_fds, const int *
     PixmapPtr pixmap = NullPixmap;
     LoriePixmapPriv *priv = NULL;
 
+    if (lorieServerDebugEnabled)
+        log(INFO, "DRI3: import request modifier %llu, %ux%u stride %u fd-count %u",
+            (unsigned long long) modifier, width, height,
+            (unsigned int) (num_fds ? strides[0] : 0), num_fds);
+
     check(num_fds > 1, "DRI3: More than 1 fd");
     check(modifier != RAW_MMAPPABLE_FD && modifier != AHARDWAREBUFFER_SOCKET_FD && modifier != AHARDWAREBUFFER_FLIPPED_SOCKET_FD &&
           modifier != DRM_FORMAT_MOD_INVALID && modifier != DRM_FORMAT_MOD_LINEAR, "DRI3: Modifier is not RAW_MMAPPABLE_FD or AHARDWAREBUFFER_SOCKET_FD");
@@ -1130,7 +1144,8 @@ static PixmapPtr loriePixmapFromFds(ScreenPtr screen, CARD8 num_fds, const int *
     priv->imported = true;
 
     if (modifier == DRM_FORMAT_MOD_INVALID || modifier == DRM_FORMAT_MOD_LINEAR || modifier == RAW_MMAPPABLE_FD) {
-        check(!(priv->buffer = LorieBuffer_wrapFileDescriptor(width, strides[0]/4, height, AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM, fds[0], offsets[0])), "DRI3: LorieBuffer_wrapAHardwareBuffer failed.");
+        check(!(priv->buffer = LorieBuffer_wrapFileDescriptor(width, strides[0]/4, height, AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM, fds[0], offsets[0])),
+              "DRI3: raw-fd wrap failed, modifier %llu", (unsigned long long) modifier);
         screen->ModifyPixmapHeader(pixmap, width, height, 0, 0, strides[0], NULL);
         if (lorieServerDebugEnabled)
             log(INFO, "DRI3: imported raw fd, modifier %llu, %ux%u stride %u", (unsigned long long) modifier, width, height, strides[0]);
@@ -1140,10 +1155,14 @@ static PixmapPtr loriePixmapFromFds(ScreenPtr screen, CARD8 num_fds, const int *
     if (modifier == AHARDWAREBUFFER_SOCKET_FD || modifier == AHARDWAREBUFFER_FLIPPED_SOCKET_FD) {
         priv->flipped = modifier == AHARDWAREBUFFER_FLIPPED_SOCKET_FD;
         check(!(priv->buffer = lorieReceiveSocketBuffer(fds[0], &desc)), "DRI3: failed to import AHardwareBuffer");
+        check(desc.width < width || desc.height < height,
+              "DRI3: AHardwareBuffer %ux%u is smaller than the requested pixmap %ux%u",
+              desc.width, desc.height, width, height);
 
         screen->ModifyPixmapHeader(pixmap, width, height, 0, 0, desc.stride * 4, NULL);
         if (lorieServerDebugEnabled)
-            log(INFO, "DRI3: imported AHardwareBuffer, modifier %llu, %ux%u stride %u", (unsigned long long) modifier, desc.width, desc.height, desc.stride);
+            log(INFO, "DRI3: imported AHardwareBuffer, modifier %llu, logical %ux%u physical %ux%u stride %u",
+                (unsigned long long) modifier, width, height, desc.width, desc.height, desc.stride);
     }
 
     return pixmap;
@@ -1155,6 +1174,58 @@ static PixmapPtr loriePixmapFromFds(ScreenPtr screen, CARD8 num_fds, const int *
     return NULL;
 }
 
+static int lorieDri3Open(__unused ClientPtr client, __unused ScreenPtr screen,
+                         __unused RRProviderPtr provider, int *fd) {
+    int mali = open("/dev/mali0", O_RDWR | O_CLOEXEC | O_NONBLOCK);
+    if (mali < 0)
+        return BadAlloc;
+
+    *fd = mali;
+    return Success;
+}
+
+static int lorieFdsFromPixmap(__unused ScreenPtr screen, PixmapPtr pixmap,
+                              int *fds, uint32_t *strides,
+                              uint32_t *offsets, uint64_t *modifier) {
+    LorieBuffer *buffer = lorieEnsureGpuSampleable(pixmap, LORIEBUFFER_FD);
+    uint32_t size;
+    if (!buffer)
+        return 0;
+    const LorieBuffer_Desc *desc = LorieBuffer_description(buffer);
+
+    fds[0] = LorieBuffer_exportFileDescriptor(buffer, &offsets[0], &size);
+    if (fds[0] < 0)
+        return 0;
+
+    strides[0] = desc->stride * 4;
+    *modifier = DRM_FORMAT_MOD_LINEAR;
+    return 1;
+}
+
+static int lorieFdFromPixmap(__unused ScreenPtr screen, PixmapPtr pixmap,
+                             CARD16 *stride, CARD32 *size) {
+    LorieBuffer *buffer = lorieEnsureGpuSampleable(pixmap, LORIEBUFFER_FD);
+    uint32_t offset;
+    int fd;
+    if (!buffer)
+        return -1;
+
+    const LorieBuffer_Desc *desc = LorieBuffer_description(buffer);
+    if ((uint32_t) desc->stride * 4 > UINT16_MAX)
+        return -1;
+
+    fd = LorieBuffer_exportFileDescriptor(buffer, &offset, size);
+    if (fd < 0)
+        return -1;
+    if (offset != 0) {
+        close(fd);
+        return -1;
+    }
+
+    *stride = (CARD16) desc->stride * 4;
+    return fd;
+}
+
 static int lorieGetFormats(__unused ScreenPtr screen, CARD32 *num_formats, CARD32 **formats) {
     static CARD32 format = DRM_FORMAT_ARGB8888;
     *num_formats = 1;
@@ -1162,8 +1233,18 @@ static int lorieGetFormats(__unused ScreenPtr screen, CARD32 *num_formats, CARD3
     return TRUE;
 }
 
+/* 1255 is Termux:X11's private AHardwareBuffer socket transport.  It is not
+ * a GPU memory layout, so clients still allocate a linear render target;
+ * advertising it tells DRI3 that an exported pixmap may use the socket
+ * transport without being rejected and replaced by a raw-fd fallback. */
+#define LORIE_AHARDWAREBUFFER_SOCKET_MODIFIER 1255ULL
+
+static uint64_t lorieSupportedModifiers[] = {
+    LORIE_AHARDWAREBUFFER_SOCKET_MODIFIER,
+    DRM_FORMAT_MOD_LINEAR,
+};
+
 static int lorieGetModifiers(__unused ScreenPtr screen, uint32_t format, uint32_t *num_modifiers, uint64_t **modifiers) {
-    static uint64_t modifier = DRM_FORMAT_MOD_LINEAR;
 
     if (format != DRM_FORMAT_ARGB8888 && format != DRM_FORMAT_XRGB8888) {
         *num_modifiers = 0;
@@ -1171,18 +1252,40 @@ static int lorieGetModifiers(__unused ScreenPtr screen, uint32_t format, uint32_
         return TRUE;
     }
 
-    *num_modifiers = 1;
-    *modifiers = &modifier;
+    *num_modifiers = sizeof(lorieSupportedModifiers) / sizeof(lorieSupportedModifiers[0]);
+    *modifiers = lorieSupportedModifiers;
+    return TRUE;
+}
+
+static int lorieGetDrawableModifiers(__unused DrawablePtr draw, uint32_t format,
+                                     uint32_t *num_modifiers, uint64_t **modifiers) {
+    uint64_t *copy;
+
+    if (format != DRM_FORMAT_ARGB8888 && format != DRM_FORMAT_XRGB8888) {
+        *num_modifiers = 0;
+        *modifiers = NULL;
+        return TRUE;
+    }
+
+    copy = malloc(sizeof(lorieSupportedModifiers));
+    if (!copy)
+        return FALSE;
+
+    memcpy(copy, lorieSupportedModifiers, sizeof(lorieSupportedModifiers));
+    *num_modifiers = sizeof(lorieSupportedModifiers) / sizeof(lorieSupportedModifiers[0]);
+    *modifiers = copy;
     return TRUE;
 }
 
 static dri3_screen_info_rec lorieDri3Info = {
         .version = 2,
-        .fds_from_pixmap = FalseNoop,
+        .fd_from_pixmap = lorieFdFromPixmap,
+        .open_client = lorieDri3Open,
+        .fds_from_pixmap = lorieFdsFromPixmap,
         .pixmap_from_fds = loriePixmapFromFds,
         .get_formats = lorieGetFormats,
         .get_modifiers = lorieGetModifiers,
-        .get_drawable_modifiers = FalseNoop
+        .get_drawable_modifiers = lorieGetDrawableModifiers
 };
 
 static GLboolean drawableSwapBuffers(unused ClientPtr client, unused __GLXdrawable * drawable) { return TRUE; }

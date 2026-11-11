@@ -13,11 +13,15 @@
 #include <pixman.h>
 #include <stdbool.h>
 #include <linux/memfd.h>
+#include <linux/dma-heap.h>
+#include <linux/dma-buf.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <errno.h>
+#include <time.h>
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <GLES2/gl2.h>
@@ -71,6 +75,46 @@ static int memfd_create(const char *name, unsigned int flags) {
 static inline size_t alignToPage(size_t size) {
     size_t page_size = sysconf(_SC_PAGE_SIZE);
     return (size + page_size - 1) & ~(page_size - 1);
+}
+
+/* Panfrost v7+ requires a 64-byte row stride when sampling regular linear
+ * textures. FD-backed pixmaps are exported through DRI3 and may become
+ * compositor textures, so pad rows at allocation time instead of advertising
+ * a stride that does not match the backing memory. */
+static inline int32_t alignGpuSampledStride(int32_t width) {
+    const int32_t pixels_per_alignment = 64 / sizeof(uint32_t);
+    return (width + pixels_per_alignment - 1) & ~(pixels_per_alignment - 1);
+}
+
+static int createDmaHeapRegion(size_t size) {
+    struct dma_heap_allocation_data allocation = {
+        .len = alignToPage(size),
+        .fd_flags = O_RDWR | O_CLOEXEC,
+        .heap_flags = 0,
+    };
+    int heap = open("/dev/dma_heap/system", O_RDONLY | O_CLOEXEC);
+    if (heap < 0)
+        return -1;
+
+    int ret = ioctl(heap, DMA_HEAP_IOCTL_ALLOC, &allocation);
+    int saved_errno = errno;
+    close(heap);
+    errno = saved_errno;
+    return ret == 0 ? (int) allocation.fd : -1;
+}
+
+static int syncDmaBuf(int fd, uint64_t flags) {
+    struct dma_buf_sync sync = { .flags = flags };
+    int ret;
+
+    do {
+        ret = ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync);
+    } while (ret < 0 && errno == EINTR);
+
+    /* LORIEBUFFER_FD can fall back to ashmem on devices without DMA heaps. */
+    if (ret < 0 && errno == ENOTTY)
+        return 0;
+    return ret;
 }
 
 #pragma clang diagnostic push
@@ -178,12 +222,16 @@ static LorieBuffer* allocate(int32_t width, int32_t stride, int32_t height, int8
 
 __LIBC_HIDDEN__ LorieBuffer* LorieBuffer_allocate(int32_t width, int32_t height, int8_t format, int8_t type) {
     int fd = -1;
+    int32_t stride = width;
     size_t size = 0;
     AHardwareBuffer *ahardwarebuffer = NULL;
 
     if (type == LORIEBUFFER_FD) {
-        size = alignToPage(width * height * sizeof(uint32_t));
-        fd = LorieBuffer_createRegion("LorieBuffer", size);
+        stride = alignGpuSampledStride(width);
+        size = alignToPage(stride * height * sizeof(uint32_t));
+        fd = createDmaHeapRegion(size);
+        if (fd < 0)
+            fd = LorieBuffer_createRegion("LorieBuffer", size);
         if (fd < 0)
             return NULL;
     } else if (type == LORIEBUFFER_AHARDWAREBUFFER) {
@@ -196,7 +244,7 @@ __LIBC_HIDDEN__ LorieBuffer* LorieBuffer_allocate(int32_t width, int32_t height,
             dprintf(2, "FATAL: failed to allocate AHardwareBuffer (width %d height %d format %d): error %d\n", width, height, format, err);
     }
 
-    return allocate(width, width, height, format, type, ahardwarebuffer, fd, size, 0, true);
+    return allocate(width, stride, height, format, type, ahardwarebuffer, fd, size, 0, true);
 }
 
 __LIBC_HIDDEN__ LorieBuffer* LorieBuffer_wrapFileDescriptor(int32_t width, int32_t stride, int32_t height, int8_t format, int fd, off_t offset) {
@@ -204,7 +252,17 @@ __LIBC_HIDDEN__ LorieBuffer* LorieBuffer_wrapFileDescriptor(int32_t width, int32
 }
 
 __LIBC_HIDDEN__ LorieBuffer* LorieBuffer_wrapAHardwareBuffer(AHardwareBuffer* buffer) {
-    return allocate(0, 0, 0, 0, LORIEBUFFER_AHARDWAREBUFFER, buffer, -1, 0, 0, false);
+    LorieBuffer *wrapped = allocate(0, 0, 0, 0, LORIEBUFFER_AHARDWAREBUFFER,
+                                    buffer, -1, 0, 0, false);
+    if (getenv("TERMUX_X11_DEBUG")) {
+        AHardwareBuffer_Desc desc = {0};
+        if (buffer)
+            AHardwareBuffer_describe(buffer, &desc);
+        dprintf(2, "AHB wrap input=%p result=%p size=%ux%u stride=%u format=%u\n",
+                buffer, wrapped, desc.width, desc.height, desc.stride,
+                desc.format);
+    }
+    return wrapped;
 }
 
 __LIBC_HIDDEN__ void LorieBuffer_convert(LorieBuffer* buffer, int8_t type, int8_t format) {
@@ -215,8 +273,12 @@ __LIBC_HIDDEN__ void LorieBuffer_convert(LorieBuffer* buffer, int8_t type, int8_
         return;
 
     if (type == LORIEBUFFER_FD) {
-        size_t size = alignToPage(buffer->desc.stride * buffer->desc.height * sizeof(uint32_t));
-        int fd = LorieBuffer_createRegion("LorieBuffer", size);
+        const int32_t sourceStride = buffer->desc.stride;
+        const int32_t destinationStride = alignGpuSampledStride(buffer->desc.width);
+        size_t size = alignToPage(destinationStride * buffer->desc.height * sizeof(uint32_t));
+        int fd = createDmaHeapRegion(size);
+        if (fd < 0)
+            fd = LorieBuffer_createRegion("LorieBuffer", size);
         if (fd < 0)
             return;
 
@@ -226,10 +288,21 @@ __LIBC_HIDDEN__ void LorieBuffer_convert(LorieBuffer* buffer, int8_t type, int8_
             return;
         }
 
-        pixman_blt(buffer->desc.data, data, buffer->desc.stride, buffer->desc.stride, 32, 32, 0, 0, 0, 0, buffer->desc.width, buffer->desc.height);
+        if (syncDmaBuf(fd, DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE) < 0) {
+            munmap(data, size);
+            close(fd);
+            return;
+        }
+        pixman_blt(buffer->desc.data, data, sourceStride, destinationStride, 32, 32, 0, 0, 0, 0, buffer->desc.width, buffer->desc.height);
+        if (syncDmaBuf(fd, DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE) < 0) {
+            munmap(data, size);
+            close(fd);
+            return;
+        }
 
         buffer->desc.type = type;
         buffer->desc.format = format;
+        buffer->desc.stride = destinationStride;
         buffer->fd = fd;
         buffer->size = size;
         buffer->offset = 0;
@@ -289,6 +362,29 @@ __LIBC_HIDDEN__ void __LorieBuffer_free(LorieBuffer* buffer) {
             free(buffer->desc.data);
             break;
         case LORIEBUFFER_FD:
+            {
+                const bool log_sync =
+                    getenv("TERMUX_X11_LOG_FD_RELEASE_SYNC") != NULL;
+                struct timespec started = {0}, finished = {0};
+                if (log_sync)
+                    clock_gettime(CLOCK_MONOTONIC, &started);
+                int start_ret = syncDmaBuf(
+                    buffer->fd, DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ |
+                                DMA_BUF_SYNC_WRITE);
+                int end_ret = syncDmaBuf(
+                    buffer->fd, DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ |
+                                DMA_BUF_SYNC_WRITE);
+                if (log_sync) {
+                    clock_gettime(CLOCK_MONOTONIC, &finished);
+                    uint64_t elapsed_ns =
+                        (uint64_t)(finished.tv_sec - started.tv_sec) *
+                            1000000000ull +
+                        (uint64_t)(finished.tv_nsec - started.tv_nsec);
+                    dprintf(2, "DMA-BUF release sync fd=%d elapsed_ns=%llu ret=%d/%d\n",
+                            buffer->fd, (unsigned long long)elapsed_ns,
+                            start_ret, end_ret);
+                }
+            }
             munmap(buffer->desc.data, buffer->size);
             close(buffer->fd);
             break;
@@ -307,6 +403,22 @@ __LIBC_HIDDEN__ const LorieBuffer_Desc* LorieBuffer_description(LorieBuffer* buf
     return buffer ? &buffer->desc : &none;
 }
 
+__LIBC_HIDDEN__ int LorieBuffer_exportFileDescriptor(LorieBuffer* buffer,
+                                                      uint32_t* offset,
+                                                      uint32_t* size) {
+    if (!buffer || !offset || !size || buffer->desc.type != LORIEBUFFER_FD ||
+        buffer->fd < 0 || buffer->offset < 0 || buffer->offset > UINT32_MAX ||
+        buffer->size > UINT32_MAX)
+        return -1;
+
+    int fd = fcntl(buffer->fd, F_DUPFD_CLOEXEC, 0);
+    if (fd >= 0) {
+        *offset = (uint32_t) buffer->offset;
+        *size = (uint32_t) buffer->size;
+    }
+    return fd;
+}
+
 __LIBC_HIDDEN__ int LorieBuffer_lock(LorieBuffer* buffer, void** out) {
     int ret = 0;
     if (!buffer)
@@ -319,7 +431,12 @@ __LIBC_HIDDEN__ int LorieBuffer_lock(LorieBuffer* buffer, void** out) {
         return EEXIST;
     }
 
-    if (buffer->desc.type == LORIEBUFFER_REGULAR || buffer->desc.type == LORIEBUFFER_FD)
+    if (buffer->desc.type == LORIEBUFFER_FD) {
+        if (syncDmaBuf(buffer->fd, DMA_BUF_SYNC_START |
+                                  DMA_BUF_SYNC_READ | DMA_BUF_SYNC_WRITE) < 0)
+            return errno;
+        buffer->lockedData = buffer->desc.data;
+    } else if (buffer->desc.type == LORIEBUFFER_REGULAR)
         buffer->lockedData = buffer->desc.data;
     else if (buffer->desc.type == LORIEBUFFER_AHARDWAREBUFFER) {
         if (__builtin_available(android 26, *))
@@ -351,6 +468,10 @@ __LIBC_HIDDEN__ int LorieBuffer_unlock(LorieBuffer* buffer) {
     if (buffer->desc.type == LORIEBUFFER_AHARDWAREBUFFER) {
         if (__builtin_available(android 26, *))
             ret = AHardwareBuffer_unlock(buffer->desc.buffer, NULL);
+    } else if (buffer->desc.type == LORIEBUFFER_FD &&
+               syncDmaBuf(buffer->fd, DMA_BUF_SYNC_END |
+                                      DMA_BUF_SYNC_READ | DMA_BUF_SYNC_WRITE) < 0) {
+        ret = errno;
     }
 
     buffer->lockedData = NULL;
@@ -457,8 +578,11 @@ __LIBC_HIDDEN__ void LorieBuffer_bindTexture(LorieBuffer *buffer) {
         return;
 
     glBindTexture(GL_TEXTURE_2D, buffer->id);
-    if (buffer->desc.type == LORIEBUFFER_FD)
+    if (buffer->desc.type == LORIEBUFFER_FD) {
+        syncDmaBuf(buffer->fd, DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ);
         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, buffer->desc.stride, buffer->desc.height, buffer->desc.format == AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM ? GL_BGRA_EXT : GL_RGBA, GL_UNSIGNED_BYTE, buffer->desc.data);
+        syncDmaBuf(buffer->fd, DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ);
+    }
 }
 
 __LIBC_HIDDEN__ unsigned int LorieBuffer_getGLTextureId(LorieBuffer *buffer) {
